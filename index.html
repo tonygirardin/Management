@@ -190,11 +190,23 @@ textarea{min-height:90px;resize:vertical}
     <textarea id="crOut" aria-label="Compte rendu généré"></textarea>
   </section>
 
-  <p class="note">Les tâches, les cases cochées et les déplacements sont gardés dans ce navigateur uniquement. Chacun peut ouvrir la page de son côté, mais seul ton CR fait foi pour le directeur.</p>
+  <p class="note"><span id="syncNote">Les tâches, les cases cochées et les déplacements sont gardés dans ce navigateur uniquement. Chacun peut ouvrir la page de son côté, mais seul ton CR fait foi pour le directeur.</span></p>
 </div>
 <div class="toast" id="toast" hidden></div>
 
-<script>
+<script type="module">
+/* Partage en temps réel : coller ici la configuration Firebase (console Firebase > Paramètres du projet > Vos applications > Config).
+   Laisser à null pour garder les tâches dans ce navigateur uniquement. */
+const FIREBASE_CONFIG={
+  apiKey:"AIzaSyBrq_Y2oNSZ0vN8m-fLV3JUTPGShgH9vKg",
+  authDomain:"regie-856e6.firebaseapp.com",
+  projectId:"regie-856e6",
+  storageBucket:"regie-856e6.firebasestorage.app",
+  messagingSenderId:"795723274279",
+  appId:"1:795723274279:web:672fb546d27cf06617d602"
+};
+const FB_VERSION="10.14.1",COL="regie-tasks",META="regie-meta";
+
 const PEOPLE={
   team:{name:"Toute l'équipe",role:"en continu",c:"var(--team)"},
   tony:{name:"Tony",role:"responsable magasin, tuteur",c:"var(--tony)"},
@@ -283,8 +295,56 @@ function load(){
   return t;
 }
 let tasks=load();
-const save=()=>store.set("regie-tasks-v3",tasks);
+tasks.forEach((t,i)=>{if(t.ord==null)t.ord=i});
+/* Synchronisation : un document Firestore par tâche, on n'envoie que celles qui ont changé */
+let fs=null,db=null,synced=null,pendingRemote=null;
+const clean=t=>JSON.parse(JSON.stringify(t));
+function push(){
+  if(!synced)return;
+  const b=fs.writeBatch(db),ids=new Set();let n=0;
+  tasks.forEach((t,i)=>{
+    ids.add(t.id);if(t.ord==null)t.ord=Date.now()+i;
+    const j=JSON.stringify(clean(t));
+    if(synced.get(t.id)!==j){b.set(fs.doc(db,COL,t.id),clean(t));synced.set(t.id,j);n++}
+  });
+  [...synced.keys()].forEach(id=>{if(!ids.has(id)){b.delete(fs.doc(db,COL,id));synced.delete(id);n++}});
+  if(!n)return;
+  pendingRemote=null; // l'écriture locale déclenche un nouvel instantané complet
+  b.commit().catch(e=>{console.error(e);setSync("Échec de l'enregistrement partagé. Vérifiez la connexion puis rechargez la page.")});
+}
+const save=()=>{store.set("regie-tasks-v3",tasks);push()};
 save();
+function setSync(msg){$("syncNote").textContent=msg}
+function applyRemote(){
+  if(!pendingRemote||editing!==null||drag)return false;
+  const remote=pendingRemote;pendingRemote=null;
+  synced=new Map(remote.map(t=>[t.id,JSON.stringify(t)]));
+  tasks=remote;store.set("regie-tasks-v3",tasks);
+  if(pendingDelete&&!tasks.some(t=>t.id===pendingDelete))pendingDelete=null;
+  return true;
+}
+async function connect(){
+  setSync("Connexion à la liste partagée…");
+  try{
+    const app=await import(`https://www.gstatic.com/firebasejs/${FB_VERSION}/firebase-app.js`);
+    fs=await import(`https://www.gstatic.com/firebasejs/${FB_VERSION}/firebase-firestore.js`);
+    db=fs.getFirestore(app.initializeApp(FIREBASE_CONFIG));
+    // Premier lancement : la liste de ce navigateur devient la liste partagée
+    const metaRef=fs.doc(db,META,"state");
+    if(!(await fs.getDoc(metaRef)).exists()){
+      const b=fs.writeBatch(db);
+      tasks.forEach(t=>b.set(fs.doc(db,COL,t.id),clean(t)));
+      b.set(metaRef,{seeded:true,at:new Date().toISOString()});
+      await b.commit();
+    }
+  }catch(e){console.error(e);setSync("Liste partagée injoignable : les modifications restent sur cet appareil. Rechargez la page plus tard.");return}
+  fs.onSnapshot(fs.collection(db,COL),{includeMetadataChanges:true},snap=>{
+    setSync(snap.metadata.fromCache?"Hors ligne : vos modifications seront envoyées à l'équipe au retour du réseau.":"Liste partagée avec toute l'équipe, mise à jour en temps réel.");
+    if(snap.metadata.hasPendingWrites&&synced)return;
+    pendingRemote=snap.docs.map(d=>d.data()).sort((a,b)=>(a.ord??0)-(b.ord??0)||(a.id<b.id?-1:1));
+    if(applyRemote())render();
+  },e=>{console.error(e);setSync("Accès à la liste partagée refusé. Vérifiez les règles Firestore.")});
+}
 const today=iso(new Date());
 function allDays(){const s=new Set(BASE.map(d=>d.id));tasks.forEach(t=>s.add(t.day));return[...s].sort()}
 let day=isWeekend(today)?nextWorkday(today):today;
@@ -381,6 +441,7 @@ function renderEdit(li,t){
 }
 
 function render(){
+  applyRemote();
   renderBar();groupsEl.innerHTML="";
   let total=0,ok=0;
   ORDER.forEach(p=>{
@@ -457,7 +518,7 @@ $("addForm").addEventListener("submit",e=>{
   const title=$("newTitle").value.trim();if(!title)return;
   let w=$("newWho").value,auto=false;
   if(w==="auto"){w=mostAvailable(day);auto=true}
-  tasks.push({id:"c-"+Date.now().toString(36),day,who:w,tag:$("newTag").value,title,detail:$("newDetail").value.trim(),mission:"",done:false,from:[],custom:true,auto});
+  tasks.push({id:"c-"+Date.now().toString(36),day,who:w,tag:$("newTag").value,title,detail:$("newDetail").value.trim(),mission:"",done:false,from:[],custom:true,auto,ord:Date.now()});
   save();
   $("newTitle").value="";$("newDetail").value="";
   const r=remaining(w,day);
@@ -497,6 +558,7 @@ $("copy").onclick=()=>{
   if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(out.value).then(()=>s.textContent="CR copié.",fb)}else fb();
 };
 render();
+if(FIREBASE_CONFIG)connect();
 </script>
 
 </body>
